@@ -1,0 +1,2 @@
+experiment,n_runs,mean_acc,std_acc,notes
+baseline_runpod_5seeds,5,0.9399,0.0016,RTX 4090 pod, default airbench94
