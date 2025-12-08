@@ -48,7 +48,7 @@ hyp = {
     'opt': {
         'train_epochs': 9.9,
         'batch_size': BATCH_SIZE,
-        'lr': 23.0,
+        'lr': 11.5,
         'momentum': 0.85,
         'weight_decay': 0.0153,
         'bias_scaler': 64.0,
