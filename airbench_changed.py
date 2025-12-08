@@ -30,9 +30,9 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # Config D (Architecture):  BS=1024, WIDTH=1.0, GROUPS=True
 
 EXPERIMENT_NAME = "h100_grouped"
-BATCH_SIZE = 1024
+BATCH_SIZE = 4096
 WIDTH_MULTIPLIER = 1
-USE_GROUPED_CONV = True
+USE_GROUPED_CONV = False
 N_RUNS = 100
 # ----------------------------------------------------
 
@@ -48,7 +48,7 @@ hyp = {
     'opt': {
         'train_epochs': 9.9,
         'batch_size': BATCH_SIZE,
-        'lr': 11.5,
+        'lr': 46.0,
         'momentum': 0.85,
         'weight_decay': 0.0153,
         'bias_scaler': 64.0,
@@ -351,6 +351,7 @@ def main(run):
     
     total_train_steps = ceil(len(train_loader) * epochs)
     model = make_net()
+    model = torch.compile(model)
     current_steps = 0
 
     norm_biases = [p for k, p in model.named_parameters() if 'norm' in k and p.requires_grad]
