@@ -350,12 +350,31 @@ def main(run):
         train_loader.labels = torch.randint(0, 10, size=(len(train_loader.labels),), device=train_loader.labels.device)
     
     total_train_steps = ceil(len(train_loader) * epochs)
+    
+    # --- FIX START: Order of Operations ---
     model = make_net()
+    
+    # 1. Grab a direct reference to the whitening layer (layer 0) BEFORE compiling.
+    # We need this reference to toggle requires_grad inside the loop later.
+    whitening_layer = model[0] 
+
+    # 2. Initialize Whitening BEFORE compiling
+    # (Accessing model[0] on a compiled model causes the 'not subscriptable' error)
+    train_images = train_loader.normalize(train_loader.images[:5000])
+    init_whitening_conv(whitening_layer, train_images)
+
+    # 3. NOW we compile (The model structure is frozen, but weights can change)
     model = torch.compile(model)
+    # --- FIX END ---
+
     current_steps = 0
 
+    # Note: We must iterate over named_parameters of the ORIGINATING model if strictly needed, 
+    # but usually compiled models support .named_parameters(). 
+    # If this fails, we can use model._orig_mod.named_parameters()
     norm_biases = [p for k, p in model.named_parameters() if 'norm' in k and p.requires_grad]
     other_params = [p for k, p in model.named_parameters() if 'norm' not in k and p.requires_grad]
+    
     param_configs = [dict(params=norm_biases, lr=lr_biases, weight_decay=wd/lr_biases),
                      dict(params=other_params, lr=lr, weight_decay=wd/lr)]
     optimizer = torch.optim.SGD(param_configs, momentum=momentum, nesterov=True)
@@ -385,8 +404,7 @@ def main(run):
     else:
         start_time = time.time()
 
-    train_images = train_loader.normalize(train_loader.images[:5000])
-    init_whitening_conv(model[0], train_images)
+    # (Whitening init moved to top)
 
     if use_cuda_timing:
         ender.record()
@@ -396,7 +414,10 @@ def main(run):
         total_time_seconds += time.time() - start_time
 
     for epoch in range(ceil(epochs)):
-        model[0].bias.requires_grad = (epoch < hyp['opt']['whiten_bias_epochs'])
+        
+        # --- FIX: Use the saved reference, not model[0] ---
+        whitening_layer.bias.requires_grad = (epoch < hyp['opt']['whiten_bias_epochs'])
+        
         if use_cuda_timing:
             starter.record()
         else:
