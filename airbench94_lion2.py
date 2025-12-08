@@ -31,15 +31,15 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # --- Experiment config -------------------------------------------------------
 
-# Naming: PConv (FasterNet) Architecture + SGD + Channels Last
-EXPERIMENT_NAME = "cifar10_pconv_sgd_channels_last"
+# Naming: Grouped Conv (groups=4) + ReLU + Channels Last
+EXPERIMENT_NAME = "cifar10_grouped_relu_channels_last"
 
 def set_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-# BACK TO SGD (Reliable Accuracy)
+# SGD is the safest bet for accuracy
 OPTIMIZER = "sgd"
 
 # 1.0 = baseline widths
@@ -118,17 +118,17 @@ def batch_crop(images, crop_size):
         for sy in range(-r, r + 1):
             for sx in range(-r, r + 1):
                 mask = (shifts[:, 0] == sy) & (shifts[:, 1] == sx)
-                images_out[mask] = images[mask, :, r + sy:r + sy+crop_size, r + sx:r + sx+crop_size]
+                images_out[mask] = images[mask, :, r + sy:r + sy + crop_size, r + sx:r + sx + crop_size]
     else:
         images_tmp = torch.empty((len(images), 3, crop_size, crop_size + 2 * r), device=images.device,
                                  dtype=images.dtype, memory_format=mem_fmt)
 
         for s in range(-r, r + 1):
             mask = (shifts[:, 0] == s)
-            images_tmp[mask] = images[mask, :, r + s:r + s+crop_size, :]
+            images_tmp[mask] = images[mask, :, r + s:r + s + crop_size, :]
         for s in range(-r, r + 1):
             mask = (shifts[:, 1] == s)
-            images_out[mask] = images_tmp[mask, :, :, r + s:r + s+crop_size]
+            images_out[mask] = images_tmp[mask, :, :, r + s:r + s + crop_size]
 
     return images_out
 
@@ -230,8 +230,9 @@ class BatchNorm(nn.BatchNorm2d):
         # Note that PyTorch already initializes the weights to one and bias to zero
 
 class Conv(nn.Conv2d):
-    def __init__(self, in_channels, out_channels, kernel_size=3, padding='same', bias=False):
-        super().__init__(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=bias)
+    # Added 'groups' parameter here to support grouped convolutions
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding='same', bias=False, groups=1):
+        super().__init__(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=bias, groups=groups)
 
     def reset_parameters(self):
         super().reset_parameters()
@@ -240,60 +241,31 @@ class Conv(nn.Conv2d):
         w = self.weight.data
         torch.nn.init.dirac_(w[:w.size(1)])
 
-# --- NEW: Partial Convolution Block (FasterNet, CVPR 2023) ---
-class PConvBlock(nn.Module):
-    def __init__(self, dim, batchnorm_momentum, n_div=4):
-        super().__init__()
-        self.dim_conv = dim // n_div
-        self.dim_untouched = dim - self.dim_conv
-        
-        # Partial Conv: 3x3 conv on only 1/4 of the channels
-        # Note: We use the script's custom Conv class to inherit initialization logic
-        # We manually manage padding since 'same' in custom Conv might behave oddly with slicing
-        self.partial_conv = Conv(self.dim_conv, self.dim_conv, kernel_size=3, padding=1, bias=False)
-        
-        # Pointwise Conv: 1x1 conv on ALL channels to mix features
-        self.pw_conv = Conv(dim, dim, kernel_size=1, padding=0, bias=False)
-        
-        self.norm = BatchNorm(dim, batchnorm_momentum)
-        self.activ = nn.ReLU(inplace=True) # ReLU is faster than GELU
-
-    def forward(self, x):
-        # 1. Partial Convolution (PConv)
-        # Split channels: convolve the first part, pass the rest through
-        # We assume x is NCHW
-        x_conv = self.partial_conv(x[:, :self.dim_conv, :, :])
-        x_untouched = x[:, self.dim_conv:, :, :]
-        x = torch.cat((x_conv, x_untouched), dim=1)
-        
-        # 2. Pointwise Convolution (PWConv)
-        x = self.pw_conv(x)
-        x = self.norm(x)
-        x = self.activ(x)
-        return x
-
 class ConvGroup(nn.Module):
     def __init__(self, channels_in, channels_out, batchnorm_momentum):
         super().__init__()
-        # Stage 1: Standard Conv (Expand channels) - Keep this for stability
-        self.conv1 = Conv(channels_in,  channels_out)
+        # Stage 1: Standard Conv (Expand channels) - Keep groups=1 for mixing
+        self.conv1 = Conv(channels_in,  channels_out, groups=1)
         self.pool = nn.MaxPool2d(2)
         self.norm1 = BatchNorm(channels_out, batchnorm_momentum)
-        # We swap GELU for ReLU here too for a free speedup
-        self.activ1 = nn.ReLU(inplace=True)
-
-        # Stage 2: PConv Block (The Speedup)
-        # Replaces the original conv2 -> norm2 -> activ sequence
-        self.pconv_block = PConvBlock(channels_out, batchnorm_momentum)
+        
+        # Free Speedup: Use ReLU instead of GELU
+        self.activ = nn.ReLU(inplace=True)
+        
+        # Stage 2: Grouped Conv (The Speedup)
+        # groups=4 means 4x fewer parameters and FLOPs for this layer
+        # This is hardware optimized (unlike PConv)
+        self.conv2 = Conv(channels_out, channels_out, groups=4) 
+        self.norm2 = BatchNorm(channels_out, batchnorm_momentum)
 
     def forward(self, x):
         x = self.conv1(x)
         x = self.pool(x)
         x = self.norm1(x)
-        x = self.activ1(x)
-        
-        # Use the new fast block
-        x = self.pconv_block(x)
+        x = self.activ(x)
+        x = self.conv2(x)
+        x = self.norm2(x)
+        x = self.activ(x)
         return x
 
 #############################################
@@ -476,18 +448,21 @@ def main(run):
     norm_biases = [p for k, p in model.named_parameters() if 'norm' in k and p.requires_grad]
     other_params = [p for k, p in model.named_parameters() if 'norm' not in k and p.requires_grad]
 
-    # SGD LOGIC (Restored for accuracy)
     param_configs = [
         dict(params=norm_biases, lr=lr_biases, weight_decay=wd / lr_biases),
         dict(params=other_params, lr=lr, weight_decay=wd / lr),
     ]
-    optimizer = torch.optim.SGD(
-        param_configs,
-        lr=1.0,
-        momentum=momentum,
-        weight_decay=0.0,
-        nesterov=True,
-    )
+
+    if OPTIMIZER == "sgd":
+        optimizer = torch.optim.SGD(
+            param_configs,
+            lr=1.0,
+            momentum=momentum,
+            weight_decay=0.0,
+            nesterov=True,
+        )
+    else:
+        raise ValueError(f"Unknown OPTIMIZER={OPTIMIZER!r}")
 
     def get_lr(step):
         warmup_steps = int(total_train_steps * 0.23)
