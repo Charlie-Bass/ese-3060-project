@@ -30,7 +30,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # Config D (Architecture):  BS=1024, WIDTH=1.0, GROUPS=True
 
 EXPERIMENT_NAME = "h100_4096_2.0"
-BATCH_SIZE = 4096
+BATCH_SIZE = 2048
 WIDTH_MULTIPLIER = 1
 USE_GROUPED_CONV = False
 N_RUNS = 100
@@ -48,7 +48,7 @@ hyp = {
     'opt': {
         'train_epochs': 9.9,
         'batch_size': BATCH_SIZE,
-        'lr': 46.0,
+        'lr': 23.0,
         'momentum': 0.85,
         'weight_decay': 0.0153,
         'bias_scaler': 64.0,
