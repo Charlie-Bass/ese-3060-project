@@ -22,84 +22,26 @@ from torch import nn
 import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as T
-from torch.optim import Optimizer
 
+# --- new: H100 System Optimizations ---
 torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True # Required for H100 Tensor Cores
+torch.backends.cudnn.allow_tf32 = True
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+# --- new: Experiment Config ---
+# Config A (Baseline):      BS=1024, WIDTH=1.0, GROUPS=False
+# Config B (Batch Speed):   BS=4096, WIDTH=1.0, GROUPS=False
+# Config C (Free Lunch):    BS=1024, WIDTH=2.0, GROUPS=False
+# Config D (Architecture):  BS=1024, WIDTH=1.0, GROUPS=True (ResNeXt-style)
 
-# --- Experiment config -------------------------------------------------------
-
-EXPERIMENT_NAME = "cifar10_sgd_ls02_w1.0_channels_last"
-
-def set_seed(seed: int):
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-# sgd = baseline optimizer, lion = new optimizer
-OPTIMIZER = "lion"
-
-# 1.0 = baseline widths, < 1.0 = thinner model (pruned channels)
-WIDTH_MULTIPLIER = 1.0
-
-
-# 0.2 = baseline label smoothing, 0.0 = ablation later
-LABEL_SMOOTHING = 0.2
-
-# Use channels_last memory format for better GPU throughput
-USE_CHANNELS_LAST = True
-
-# Number of seeds / runs for this script
-N_RUNS = 100
-
-class Lion(Optimizer):
-    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0):
-        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
-        super().__init__(params, defaults)
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        for group in self.param_groups:
-            lr = group["lr"]
-            beta1, beta2 = group["betas"]
-            wd = group["weight_decay"]
-
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                grad = p.grad
-                if grad.is_sparse:
-                    raise RuntimeError("Lion does not support sparse gradients")
-
-                state = self.state[p]
-                if len(state) == 0:
-                    state["momentum"] = torch.zeros_like(p)
-
-                m = state["momentum"]
-
-                # interpolate grad & momentum for update
-                update = (1.0 - beta1) * grad + beta1 * m
-                update = update.sign()
-
-                # update momentum
-                m_new = (1.0 - beta2) * grad + beta2 * m
-
-                # decoupled weight decay
-                if wd != 0.0:
-                    update = update + wd * p.data
-
-                p.add_(update, alpha=-lr)
-                state["momentum"] = m_new
-
-        return loss
-
+EXPERIMENT_NAME = "h100_baseline"
+BATCH_SIZE = 1024        
+WIDTH_MULTIPLIER = 1.0   
+USE_GROUPED_CONV = False 
+N_RUNS = 100             
+# ------------------------------------------
 
 # We express the main training hyperparameters (batch size, learning rate, momentum, and weight decay)
 # in decoupled form, so that each one can be tuned independently. This accomplishes the following:
@@ -116,12 +58,12 @@ class Lion(Optimizer):
 hyp = {
     'opt': {
         'train_epochs': 9.9,
-        'batch_size': 1024,
+        'batch_size': BATCH_SIZE,   # new: Uses global config
         'lr': 11.5,                 # learning rate per 1024 examples
         'momentum': 0.85,
         'weight_decay': 0.0153,     # weight decay per 1024 examples (decoupled from learning rate)
         'bias_scaler': 64.0,        # scales up learning rate (but not weight decay) for BatchNorm biases
-        'label_smoothing': LABEL_SMOOTHING,
+        'label_smoothing': 0.2,
         'whiten_bias_epochs': 3,    # how many epochs to train the whitening layer bias before freezing
     },
     'aug': {
@@ -154,7 +96,15 @@ def batch_flip_lr(inputs):
 def batch_crop(images, crop_size):
     r = (images.size(-1) - crop_size)//2
     shifts = torch.randint(-r, r+1, size=(len(images), 2), device=images.device)
-    images_out = torch.empty((len(images), 3, crop_size, crop_size), device=images.device, dtype=images.dtype)
+    
+    # --- new: Fix for Channels Last Memory Format ---
+    # The original script created contiguous tensors here, breaking the optimization.
+    # We explicitly request channels_last.
+    images_out = torch.empty((len(images), 3, crop_size, crop_size), 
+                           device=images.device, 
+                           dtype=images.dtype,
+                           memory_format=torch.channels_last)
+                           
     # The two cropping methods in this if-else produce equivalent results, but the second is faster for r > 2.
     if r <= 2:
         for sy in range(-r, r+1):
@@ -162,7 +112,11 @@ def batch_crop(images, crop_size):
                 mask = (shifts[:, 0] == sy) & (shifts[:, 1] == sx)
                 images_out[mask] = images[mask, :, r+sy:r+sy+crop_size, r+sx:r+sx+crop_size]
     else:
-        images_tmp = torch.empty((len(images), 3, crop_size, crop_size+2*r), device=images.device, dtype=images.dtype)
+        images_tmp = torch.empty((len(images), 3, crop_size, crop_size+2*r), 
+                               device=images.device, 
+                               dtype=images.dtype,
+                               memory_format=torch.channels_last)
+                               
         for s in range(-r, r+1):
             mask = (shifts[:, 0] == s)
             images_tmp[mask] = images[mask, :, r+s:r+s+crop_size, :]
@@ -187,14 +141,12 @@ class CifarLoader:
 
         img_dtype = torch.float16 if device.type == 'cuda' else torch.float32
 
-        # NCHW
-        self.images = (self.images.to(img_dtype) / 255).permute(0, 3, 1, 2)
+        # --- NEW: Ensure Channels Last on Load ---
+        self.images = (self.images.to(img_dtype) / 255).permute(0, 3, 1, 2).to(
+            memory_format=torch.channels_last
+        )
 
-        # Only use channels_last on CUDA when we ask for it
-        if USE_CHANNELS_LAST and device.type == 'cuda':
-            self.images = self.images.to(memory_format=torch.channels_last)
-
-        # Move images / labels to the chosen device
+        # Move images / labels to the chosen device (CPU on your Mac)
         self.images = self.images.to(device)
         self.labels = self.labels.to(device)
 
@@ -269,8 +221,9 @@ class BatchNorm(nn.BatchNorm2d):
         # Note that PyTorch already initializes the weights to one and bias to zero
 
 class Conv(nn.Conv2d):
-    def __init__(self, in_channels, out_channels, kernel_size=3, padding='same', bias=False):
-        super().__init__(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=bias)
+    # --- NEW: Added 'groups' parameter to support architecture ablation ---
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding='same', bias=False, groups=1):
+        super().__init__(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=bias, groups=groups)
 
     def reset_parameters(self):
         super().reset_parameters()
@@ -282,12 +235,20 @@ class Conv(nn.Conv2d):
 class ConvGroup(nn.Module):
     def __init__(self, channels_in, channels_out, batchnorm_momentum):
         super().__init__()
-        self.conv1 = Conv(channels_in,  channels_out)
+        # Stage 1: Standard Conv (Expand channels) - Always dense (groups=1)
+        self.conv1 = Conv(channels_in,  channels_out, groups=1)
         self.pool = nn.MaxPool2d(2)
         self.norm1 = BatchNorm(channels_out, batchnorm_momentum)
-        self.conv2 = Conv(channels_out, channels_out)
+        
+        # --- NEW: Use ReLU instead of GELU (Free H100 Speedup) ---
+        self.activ = nn.ReLU(inplace=True)
+
+        # --- NEW: Toggleable Grouped Conv (Architecture Novelty) ---
+        # If enabled, uses groups=4 (4x parameter reduction)
+        g = 4 if USE_GROUPED_CONV else 1
+        
+        self.conv2 = Conv(channels_out, channels_out, groups=g)
         self.norm2 = BatchNorm(channels_out, batchnorm_momentum)
-        self.activ = nn.GELU()
 
     def forward(self, x):
         x = self.conv1(x)
@@ -305,16 +266,19 @@ class ConvGroup(nn.Module):
 
 def make_net():
     base_widths = hyp['net']['widths']
+    
+    # --- NEW: Apply Width Multiplier for Ablations ---
     widths = {
         k: max(8, int(v * WIDTH_MULTIPLIER))
         for k, v in base_widths.items()
     }
+    
     batchnorm_momentum = hyp['net']['batchnorm_momentum']
     whiten_kernel_size = 2
     whiten_width = 2 * 3 * whiten_kernel_size**2
     net = nn.Sequential(
         Conv(3, whiten_width, whiten_kernel_size, padding=0, bias=True),
-        nn.GELU(),
+        nn.GELU(), # Keep first GELU for stability
         ConvGroup(whiten_width,     widths['block1'], batchnorm_momentum),
         ConvGroup(widths['block1'], widths['block2'], batchnorm_momentum),
         ConvGroup(widths['block2'], widths['block3'], batchnorm_momentum),
@@ -328,9 +292,9 @@ def make_net():
     if device.type == 'cuda':
         net = net.half()
     net = net.to(device)
-
-    if USE_CHANNELS_LAST and device.type == 'cuda':
-        net = net.to(memory_format=torch.channels_last)
+    
+    # --- NEW: Ensure Channels Last Memory Format ---
+    net = net.to(memory_format=torch.channels_last)
 
     for mod in net.modules():
         if isinstance(mod, BatchNorm):
@@ -478,29 +442,11 @@ def main(run):
 
     norm_biases = [p for k, p in model.named_parameters() if 'norm' in k and p.requires_grad]
     other_params = [p for k, p in model.named_parameters() if 'norm' not in k and p.requires_grad]
-
-    param_configs = [
-        dict(params=norm_biases, lr=lr_biases, weight_decay=wd / lr_biases),
-        dict(params=other_params, lr=lr, weight_decay=wd / lr),
-    ]
-
-    if OPTIMIZER == "sgd":
-        optimizer = torch.optim.SGD(
-            param_configs,
-            lr=1.0,
-            momentum=momentum,
-            weight_decay=0.0,
-            nesterov=True,
-        )
-    elif OPTIMIZER == "lion":
-        optimizer = Lion(
-            param_configs,
-            lr=1.0,
-            betas=(0.9, 0.99),
-            weight_decay=0.0,
-        )
-    else:
-        raise ValueError(f"Unknown OPTIMIZER={OPTIMIZER!r}")
+    
+    # --- OPTIMIZER (Standard SGD) ---
+    param_configs = [dict(params=norm_biases, lr=lr_biases, weight_decay=wd/lr_biases),
+                     dict(params=other_params, lr=lr, weight_decay=wd/lr)]
+    optimizer = torch.optim.SGD(param_configs, momentum=momentum, nesterov=True)
 
     def get_lr(step):
         warmup_steps = int(total_train_steps * 0.23)
@@ -587,7 +533,7 @@ def main(run):
         train_acc = (outputs.detach().argmax(1) == labels).float().mean().item()
         train_loss = loss.item() / batch_size
         val_acc = evaluate(model, test_loader, tta_level=0)
-        print_training_details(locals(), is_final_entry=False)
+        # print_training_details(locals(), is_final_entry=False) # Silenced per-epoch logs to keep output clean
         run = None # Only print the run number once
 
     ####################
@@ -609,57 +555,72 @@ def main(run):
         total_time_seconds += time.time() - start_time
 
     epoch = 'eval'
-    print_training_details(locals(), is_final_entry=True)
+    # print_training_details(locals(), is_final_entry=True)
 
     # Return both accuracy and total wall-clock time for this run
     return tta_val_acc, total_time_seconds
 
+# --- NEW: Robust Continuous Logging Logic ---
 if __name__ == "__main__":
-    with open(sys.argv[0]) as f:
-        code = f.read()
-
-    print_columns(logging_columns_list, is_head=True)
-
-    results = [main(run) for run in range(N_RUNS)]
-    accs = torch.tensor([r[0] for r in results])
-    times = torch.tensor([r[1] for r in results])
-
-    mean_acc = accs.mean().item()
-    std_acc = accs.std(unbiased=False).item()
-    mean_time = times.mean().item()
-    std_time = times.std(unbiased=False).item()
-
-    print('Accuracy  - Mean: %.4f    Std: %.4f' % (mean_acc, std_acc))
-    print('Time (s)  - Mean: %.4f    Std: %.4f' % (mean_time, std_time))
-
-    log = {
-        'code': code,
-        'accs': accs.cpu(),
-        'times': times.cpu(),
-        'experiment_name': EXPERIMENT_NAME,
-        'optimizer': OPTIMIZER,
-        'label_smoothing': LABEL_SMOOTHING,
-        'use_channels_last': USE_CHANNELS_LAST,
-        'n_runs': N_RUNS,
-        'device': str(device),
-        'width_multiplier': WIDTH_MULTIPLIER,
-        'seeds': list(range(N_RUNS)),
-    }
-
-    try:
-        import subprocess
-        log['git_commit'] = subprocess.check_output(
-            ['git', 'rev-parse', 'HEAD'], encoding='utf-8'
-        ).strip()
-    except Exception:
-        log['git_commit'] = None
-
+    # Ensure logs directory exists
     log_root = os.path.join('logs', EXPERIMENT_NAME)
     os.makedirs(log_root, exist_ok=True)
-    log_dir = os.path.join(log_root, str(uuid.uuid4()))
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, 'log.pt')
-    print(os.path.abspath(log_path))
-    torch.save(log, log_path)
+    
+    # Use a fixed file name per experiment so it's easy to find.
+    # WARNING: This deletes the old log for this specific experiment name.
+    csv_path = 'latest_run_log.csv'
+    
+    if os.path.exists(csv_path):
+        os.remove(csv_path)
 
+    print(f"\n>>> STARTING EXPERIMENT: {EXPERIMENT_NAME} <<<")
+    print(f"    Batch Size: {BATCH_SIZE}, Width: {WIDTH_MULTIPLIER}x, Groups: {USE_GROUPED_CONV}")
+    print_columns(logging_columns_list, is_head=True)
+    
+    # Initialize headers for the CSV file
+    with open(csv_path, 'w') as f:
+        f.write('run,final_val_acc,total_time_seconds\n')
 
+    results = []
+    
+    for run in range(N_RUNS):
+        try:
+            acc, seconds = main(run)
+            results.append((acc, seconds))
+            
+            # Print status and Save to CSV immediately
+            print(f"Run {run:03d} | Acc: {acc:.4f} | Time: {seconds:.3f}s")
+            
+            with open(csv_path, 'a') as f:
+                f.write(f'{run},{acc},{seconds}\n')
+                
+        except KeyboardInterrupt:
+            print("\n\nExperiment interrupted by user. Saving gathered data...")
+            break
+        except Exception as e:
+            print(f"\n\nRun {run} failed with error: {e}")
+            continue
+
+    if len(results) > 0:
+        results_tensor = torch.tensor(results)
+        accs = results_tensor[:, 0]
+        times = results_tensor[:, 1]
+
+        mean_acc = accs.mean().item()
+        std_acc = accs.std(unbiased=False).item()
+        mean_time = times.mean().item()
+        std_time = times.std(unbiased=False).item()
+
+        print('\n' + '-'*30)
+        print(f'Completed {len(results)} runs')
+        print('Accuracy  - Mean: %.4f    Std: %.4f' % (mean_acc, std_acc))
+        print('Time (s)  - Mean: %.4f    Std: %.4f' % (mean_time, std_time))
+        print('-'*30)
+        
+        print(f"CSV log saved to: {os.path.abspath(csv_path)}")
+        
+        # Save .pt as well
+        pt_path = f"final_results_{EXPERIMENT_NAME}.pt"
+        torch.save({'accs': accs, 'times': times}, pt_path)
+    else:
+        print("No successful runs completed.")
