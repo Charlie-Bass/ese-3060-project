@@ -31,8 +31,8 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 EXPERIMENT_NAME = "h100_width2.0"
 BATCH_SIZE = 1024
-WIDTH_MULTIPLIER = 2.0
-USE_GROUPED_CONV = False
+WIDTH_MULTIPLIER = 1
+USE_GROUPED_CONV = True
 N_RUNS = 100
 # ----------------------------------------------------
 
