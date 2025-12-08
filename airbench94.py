@@ -15,7 +15,6 @@ import os
 import sys
 import uuid
 from math import ceil
-import time
 
 import torch
 from torch import nn
@@ -24,8 +23,6 @@ import torchvision
 import torchvision.transforms as T
 
 torch.backends.cudnn.benchmark = True
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # We express the main training hyperparameters (batch size, learning rate, momentum, and weight decay)
 # in decoupled form, so that each one can be tuned independently. This accomplishes the following:
@@ -107,24 +104,13 @@ class CifarLoader:
             labels = torch.tensor(dset.targets)
             torch.save({'images': images, 'labels': labels, 'classes': dset.classes}, data_path)
 
-        # Always load on CPU first to avoid Mac MPS/CUDA issues
-        data = torch.load(data_path, map_location='cpu')
+        data = torch.load(data_path, map_location=torch.device(gpu))
         self.images, self.labels, self.classes = data['images'], data['labels'], data['classes']
+        # It's faster to load+process uint8 data than to load preprocessed fp16 data
+        self.images = (self.images.half() / 255).permute(0, 3, 1, 2).to(memory_format=torch.channels_last)
 
-        img_dtype = torch.float16 if device.type == 'cuda' else torch.float32
-
-        self.images = (self.images.to(img_dtype) / 255).permute(0, 3, 1, 2).to(
-            memory_format=torch.channels_last
-        )
-
-        # Move images / labels to the chosen device (CPU on your Mac)
-        self.images = self.images.to(device)
-        self.labels = self.labels.to(device)
-
-        # Normalization constants on the same device
-        self.normalize = T.Normalize(CIFAR_MEAN.to(device), CIFAR_STD.to(device))
-
-        self.proc_images = {}
+        self.normalize = T.Normalize(CIFAR_MEAN, CIFAR_STD)
+        self.proc_images = {} # Saved results of image processing to be done on the first epoch
         self.epoch = 0
 
         self.aug = aug or {}
@@ -243,12 +229,8 @@ def make_net():
         Mul(hyp['net']['scaling_factor']),
     )
     net[0].weight.requires_grad = False
-
-    if device.type == 'cuda':
-        net = net.half()
-    net = net.to(device)
+    net = net.half().cuda()
     net = net.to(memory_format=torch.channels_last)
-
     for mod in net.modules():
         if isinstance(mod, BatchNorm):
             mod.float()
@@ -412,27 +394,17 @@ def main(run):
     lookahead_state = LookaheadState(model)
 
     # For accurately timing GPU code
-    use_cuda_timing = (device.type == 'cuda')
-    if use_cuda_timing:
-        starter = torch.cuda.Event(enable_timing=True)
-        ender = torch.cuda.Event(enable_timing=True)
+    starter = torch.cuda.Event(enable_timing=True)
+    ender = torch.cuda.Event(enable_timing=True)
     total_time_seconds = 0.0
 
     # Initialize the whitening layer using training images
-    if use_cuda_timing:
-        starter.record()
-    else:
-        start_time = time.time()
-
+    starter.record()
     train_images = train_loader.normalize(train_loader.images[:5000])
     init_whitening_conv(model[0], train_images)
-
-    if use_cuda_timing:
-        ender.record()
-        torch.cuda.synchronize()
-        total_time_seconds += 1e-3 * starter.elapsed_time(ender)
-    else:
-        total_time_seconds += time.time() - start_time
+    ender.record()
+    torch.cuda.synchronize()
+    total_time_seconds += 1e-3 * starter.elapsed_time(ender)
 
     for epoch in range(ceil(epochs)):
 
@@ -442,10 +414,7 @@ def main(run):
         #     Training     #
         ####################
 
-        if use_cuda_timing:
-            starter.record()
-        else:
-            start_time = time.time()
+        starter.record()
 
         model.train()
         for inputs, labels in train_loader:
@@ -467,12 +436,9 @@ def main(run):
                     lookahead_state.update(model, decay=1.0)
                 break
 
-        if use_cuda_timing:
-            ender.record()
-            torch.cuda.synchronize()
-            total_time_seconds += 1e-3 * starter.elapsed_time(ender)
-        else:
-            total_time_seconds += time.time() - start_time
+        ender.record()
+        torch.cuda.synchronize()
+        total_time_seconds += 1e-3 * starter.elapsed_time(ender)
 
         ####################
         #    Evaluation    #
@@ -489,19 +455,11 @@ def main(run):
     #  TTA Evaluation  #
     ####################
 
-    if use_cuda_timing:
-        starter.record()
-    else:
-        start_time = time.time()
-
+    starter.record()
     tta_val_acc = evaluate(model, test_loader, tta_level=hyp['net']['tta_level'])
-
-    if use_cuda_timing:
-        ender.record()
-        torch.cuda.synchronize()
-        total_time_seconds += 1e-3 * starter.elapsed_time(ender)
-    else:
-        total_time_seconds += time.time() - start_time
+    ender.record()
+    torch.cuda.synchronize()
+    total_time_seconds += 1e-3 * starter.elapsed_time(ender)
 
     epoch = 'eval'
     print_training_details(locals(), is_final_entry=True)
@@ -514,7 +472,7 @@ if __name__ == "__main__":
 
     print_columns(logging_columns_list, is_head=True)
     #main('warmup')
-    accs = torch.tensor([main(run) for run in range(100)])
+    accs = torch.tensor([main(run) for run in range(25)])
     print('Mean: %.4f    Std: %.4f' % (accs.mean(), accs.std()))
 
     log = {'code': code, 'accs': accs}
@@ -523,4 +481,3 @@ if __name__ == "__main__":
     log_path = os.path.join(log_dir, 'log.pt')
     print(os.path.abspath(log_path))
     torch.save(log, os.path.join(log_dir, 'log.pt'))
-
