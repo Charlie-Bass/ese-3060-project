@@ -1,19 +1,12 @@
 # Taken from https://github.com/KellerJordan/cifar10-airbench/blob/master/legacy/airbench94.py
 # Uncompiled variant of airbench94_compiled.py
-# 3.83s runtime on an A100; 0.36 PFLOPs.
-# Evidence: 94.01 average accuracy in n=1000 runs.
-#
-# We recorded the runtime of 3.83 seconds on an NVIDIA A100-SXM4-80GB with the following nvidia-smi:
-# NVIDIA-SMI 515.105.01   Driver Version: 515.105.01   CUDA Version: 11.7
-# torch.__version__ == '2.1.2+cu118'
-
-#############################################
-#            Setup/Hyperparameters          #
-#############################################
+# Optimized for H100 Speedrun Experiments
 
 import os
 import sys
 import uuid
+import random
+import numpy as np
 from math import ceil
 import time
 
@@ -23,48 +16,44 @@ import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as T
 
-# --- new: H100 System Optimizations ---
+# --- H100 SYSTEM OPTIMIZATIONS ---
 torch.backends.cudnn.benchmark = True
-torch.backends.cuda.matmul.allow_tf32 = True # Required for H100 Tensor Cores
+torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# --- new: Experiment Config ---
+# --- EXPERIMENT CONFIGURATION (EDIT THIS PER RUN) ---
 # Config A (Baseline):      BS=1024, WIDTH=1.0, GROUPS=False
 # Config B (Batch Speed):   BS=4096, WIDTH=1.0, GROUPS=False
 # Config C (Free Lunch):    BS=1024, WIDTH=2.0, GROUPS=False
-# Config D (Architecture):  BS=1024, WIDTH=1.0, GROUPS=True (ResNeXt-style)
+# Config D (Architecture):  BS=1024, WIDTH=1.0, GROUPS=True
 
 EXPERIMENT_NAME = "h100_baseline"
-BATCH_SIZE = 1024        
-WIDTH_MULTIPLIER = 1.0   
-USE_GROUPED_CONV = False 
-N_RUNS = 100             
-# ------------------------------------------
+BATCH_SIZE = 1024
+WIDTH_MULTIPLIER = 1.0
+USE_GROUPED_CONV = False
+N_RUNS = 100
+# ----------------------------------------------------
 
-# We express the main training hyperparameters (batch size, learning rate, momentum, and weight decay)
-# in decoupled form, so that each one can be tuned independently. This accomplishes the following:
-# * Assuming time-constant gradients, the average step size is decoupled from everything but the lr.
-# * The size of the weight decay update is decoupled from everything but the wd.
-# In constrast, normally when we increase the (Nesterov) momentum, this also scales up the step size
-# proportionally to 1 + 1 / (1 - momentum), meaning we cannot change momentum without having to re-tune
-# the learning rate. Similarly, normally when we increase the learning rate this also increases the size
-# of the weight decay, requiring a proportional decrease in the wd to maintain the same decay strength.
-#
-# The practical impact is that hyperparameter tuning is faster, since this parametrization allows each
-# one to be tuned independently. See https://myrtle.ai/learn/how-to-train-your-resnet-5-hyperparameters/.
+# --- FIX 1: Helper function for reproducibility ---
+def set_seed(seed):
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 hyp = {
     'opt': {
         'train_epochs': 9.9,
-        'batch_size': BATCH_SIZE,   # new: Uses global config
-        'lr': 11.5,                 # learning rate per 1024 examples
+        'batch_size': BATCH_SIZE,
+        'lr': 11.5,
         'momentum': 0.85,
-        'weight_decay': 0.0153,     # weight decay per 1024 examples (decoupled from learning rate)
-        'bias_scaler': 64.0,        # scales up learning rate (but not weight decay) for BatchNorm biases
+        'weight_decay': 0.0153,
+        'bias_scaler': 64.0,
         'label_smoothing': 0.2,
-        'whiten_bias_epochs': 3,    # how many epochs to train the whitening layer bias before freezing
+        'whiten_bias_epochs': 3,
     },
     'aug': {
         'flip': True,
@@ -78,7 +67,7 @@ hyp = {
         },
         'batchnorm_momentum': 0.6,
         'scaling_factor': 1/9,
-        'tta_level': 2,         # the level of test-time augmentation: 0=none, 1=mirror, 2=mirror+translate
+        'tta_level': 2,
     },
 }
 
@@ -97,15 +86,12 @@ def batch_crop(images, crop_size):
     r = (images.size(-1) - crop_size)//2
     shifts = torch.randint(-r, r+1, size=(len(images), 2), device=images.device)
     
-    # --- new: Fix for Channels Last Memory Format ---
-    # The original script created contiguous tensors here, breaking the optimization.
-    # We explicitly request channels_last.
+    # H100 Optimization: Explicitly request channels_last
     images_out = torch.empty((len(images), 3, crop_size, crop_size), 
                            device=images.device, 
                            dtype=images.dtype,
                            memory_format=torch.channels_last)
                            
-    # The two cropping methods in this if-else produce equivalent results, but the second is faster for r > 2.
     if r <= 2:
         for sy in range(-r, r+1):
             for sx in range(-r, r+1):
@@ -126,7 +112,6 @@ def batch_crop(images, crop_size):
     return images_out
 
 class CifarLoader:
-
     def __init__(self, path, train=True, batch_size=500, aug=None, drop_last=None, shuffle=None, gpu=0):
         data_path = os.path.join(path, 'train.pt' if train else 'test.pt')
         if not os.path.exists(data_path):
@@ -135,27 +120,20 @@ class CifarLoader:
             labels = torch.tensor(dset.targets)
             torch.save({'images': images, 'labels': labels, 'classes': dset.classes}, data_path)
 
-        # Always load on CPU first to avoid Mac MPS/CUDA issues
         data = torch.load(data_path, map_location='cpu')
         self.images, self.labels, self.classes = data['images'], data['labels'], data['classes']
-
         img_dtype = torch.float16 if device.type == 'cuda' else torch.float32
 
-        # --- NEW: Ensure Channels Last on Load ---
+        # H100 Optimization: Ensure channels_last on load
         self.images = (self.images.to(img_dtype) / 255).permute(0, 3, 1, 2).to(
             memory_format=torch.channels_last
         )
 
-        # Move images / labels to the chosen device (CPU on your Mac)
         self.images = self.images.to(device)
         self.labels = self.labels.to(device)
-
-        # Normalization constants on the same device
         self.normalize = T.Normalize(CIFAR_MEAN.to(device), CIFAR_STD.to(device))
-
         self.proc_images = {}
         self.epoch = 0
-
         self.aug = aug or {}
         for k in self.aug.keys():
             assert k in ['flip', 'translate'], 'Unrecognized key: %s' % k
@@ -168,13 +146,10 @@ class CifarLoader:
         return len(self.images)//self.batch_size if self.drop_last else ceil(len(self.images)/self.batch_size)
 
     def __iter__(self):
-
         if self.epoch == 0:
             images = self.proc_images['norm'] = self.normalize(self.images)
-            # Pre-flip images in order to do every-other epoch flipping scheme
             if self.aug.get('flip', False):
                 images = self.proc_images['flip'] = batch_flip_lr(images)
-            # Pre-pad images to save time when doing random translation
             pad = self.aug.get('translate', 0)
             if pad > 0:
                 self.proc_images['pad'] = F.pad(images, (pad,)*4, 'reflect')
@@ -185,21 +160,15 @@ class CifarLoader:
             images = self.proc_images['flip']
         else:
             images = self.proc_images['norm']
-        # Flip all images together every other epoch. This increases diversity relative to random flipping
         if self.aug.get('flip', False):
             if self.epoch % 2 == 1:
                 images = images.flip(-1)
 
         self.epoch += 1
-
         indices = (torch.randperm if self.shuffle else torch.arange)(len(images), device=images.device)
         for i in range(len(self)):
             idxs = indices[i*self.batch_size:(i+1)*self.batch_size]
             yield (images[idxs], self.labels[idxs])
-
-#############################################
-#            Network Components             #
-#############################################
 
 class Flatten(nn.Module):
     def forward(self, x):
@@ -213,15 +182,13 @@ class Mul(nn.Module):
         return x * self.scale
 
 class BatchNorm(nn.BatchNorm2d):
-    def __init__(self, num_features, momentum, eps=1e-12,
-                 weight=False, bias=True):
+    def __init__(self, num_features, momentum, eps=1e-12, weight=False, bias=True):
         super().__init__(num_features, eps=eps, momentum=1-momentum)
         self.weight.requires_grad = weight
         self.bias.requires_grad = bias
-        # Note that PyTorch already initializes the weights to one and bias to zero
 
 class Conv(nn.Conv2d):
-    # --- NEW: Added 'groups' parameter to support architecture ablation ---
+    # Added groups parameter for architecture ablations
     def __init__(self, in_channels, out_channels, kernel_size=3, padding='same', bias=False, groups=1):
         super().__init__(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=bias, groups=groups)
 
@@ -235,16 +202,16 @@ class Conv(nn.Conv2d):
 class ConvGroup(nn.Module):
     def __init__(self, channels_in, channels_out, batchnorm_momentum):
         super().__init__()
-        # Stage 1: Standard Conv (Expand channels) - Always dense (groups=1)
+        # Stage 1: Standard Conv (Expand channels) - Always dense
         self.conv1 = Conv(channels_in,  channels_out, groups=1)
         self.pool = nn.MaxPool2d(2)
         self.norm1 = BatchNorm(channels_out, batchnorm_momentum)
         
-        # --- NEW: Use ReLU instead of GELU (Free H100 Speedup) ---
+        # H100 Speedup: ReLU is faster than GELU
         self.activ = nn.ReLU(inplace=True)
 
-        # --- NEW: Toggleable Grouped Conv (Architecture Novelty) ---
-        # If enabled, uses groups=4 (4x parameter reduction)
+        # Stage 2: Toggleable Grouped Conv
+        # If enabled, uses groups=4 (ResNeXt-style efficiency)
         g = 4 if USE_GROUPED_CONV else 1
         
         self.conv2 = Conv(channels_out, channels_out, groups=g)
@@ -260,19 +227,13 @@ class ConvGroup(nn.Module):
         x = self.activ(x)
         return x
 
-#############################################
-#            Network Definition             #
-#############################################
-
 def make_net():
     base_widths = hyp['net']['widths']
-    
-    # --- NEW: Apply Width Multiplier for Ablations ---
+    # Apply Width Multiplier for Saturation Experiment
     widths = {
         k: max(8, int(v * WIDTH_MULTIPLIER))
         for k, v in base_widths.items()
     }
-    
     batchnorm_momentum = hyp['net']['batchnorm_momentum']
     whiten_kernel_size = 2
     whiten_width = 2 * 3 * whiten_kernel_size**2
@@ -288,22 +249,18 @@ def make_net():
         Mul(hyp['net']['scaling_factor']),
     )
     net[0].weight.requires_grad = False
-
+    
     if device.type == 'cuda':
         net = net.half()
     net = net.to(device)
     
-    # --- NEW: Ensure Channels Last Memory Format ---
+    # H100 Optimization: Force channels_last
     net = net.to(memory_format=torch.channels_last)
 
     for mod in net.modules():
         if isinstance(mod, BatchNorm):
             mod.float()
     return net
-
-#############################################
-#       Whitening Conv Initialization       #
-#############################################
 
 def get_patches(x, patch_shape):
     c, (h, w) = x.shape[1], patch_shape
@@ -322,23 +279,16 @@ def init_whitening_conv(layer, train_set, eps=5e-4):
     eigenvectors_scaled = eigenvectors / torch.sqrt(eigenvalues + eps)
     layer.weight.data[:] = torch.cat((eigenvectors_scaled, -eigenvectors_scaled))
 
-############################################
-#                Lookahead                 #
-############################################
-
 class LookaheadState:
     def __init__(self, net):
         self.net_ema = {k: v.clone() for k, v in net.state_dict().items()}
-
     def update(self, net, decay):
         for ema_param, net_param in zip(self.net_ema.values(), net.state_dict().values()):
             if net_param.dtype in (torch.half, torch.float):
                 ema_param.lerp_(net_param, 1-decay)
                 net_param.copy_(ema_param)
 
-############################################
-#                 Logging                  #
-############################################
+logging_columns_list = ['run', 'epoch', 'train_loss', 'train_acc', 'val_acc', 'tta_val_acc', 'total_time_seconds']
 
 def print_columns(columns_list, is_head=False, is_final_entry=False):
     print_string = ''
@@ -351,41 +301,11 @@ def print_columns(columns_list, is_head=False, is_final_entry=False):
     if is_head or is_final_entry:
         print('-'*len(print_string))
 
-logging_columns_list = ['run   ', 'epoch', 'train_loss', 'train_acc', 'val_acc', 'tta_val_acc', 'total_time_seconds']
-def print_training_details(variables, is_final_entry):
-    formatted = []
-    for col in logging_columns_list:
-        var = variables.get(col.strip(), None)
-        if type(var) in (int, str):
-            res = str(var)
-        elif type(var) is float:
-            res = '{:0.4f}'.format(var)
-        else:
-            assert var is None
-            res = ''
-        formatted.append(res.rjust(len(col)))
-    print_columns(formatted, is_final_entry=is_final_entry)
-
-############################################
-#               Evaluation                 #
-############################################
-
 def infer(model, loader, tta_level=0):
-
-    # Test-time augmentation strategy (for tta_level=2):
-    # 1. Flip/mirror the image left-to-right (50% of the time).
-    # 2. Translate the image by one pixel either up-and-left or down-and-right (50% of the time,
-    #    i.e. both happen 25% of the time).
-    #
-    # This creates 6 views per image (left/right times the two translations and no-translation),
-    # which we evaluate and then weight according to the given probabilities.
-
     def infer_basic(inputs, net):
         return net(inputs).clone()
-
     def infer_mirror(inputs, net):
         return 0.5 * net(inputs) + 0.5 * net(inputs.flip(-1))
-
     def infer_mirror_translate(inputs, net):
         logits = infer_mirror(inputs, net)
         pad = 1
@@ -409,10 +329,6 @@ def evaluate(model, loader, tta_level=0):
     logits = infer(model, loader, tta_level)
     return (logits.argmax(1) == loader.labels).float().mean().item()
 
-############################################
-#                Training                  #
-############################################
-
 def main(run):
     if isinstance(run, int):
         set_seed(run)
@@ -420,30 +336,25 @@ def main(run):
     batch_size = hyp['opt']['batch_size']
     epochs = hyp['opt']['train_epochs']
     momentum = hyp['opt']['momentum']
-    # Assuming gradients are constant in time, for Nesterov momentum, the below ratio is how much
-    # larger the default steps will be than the underlying per-example gradients. We divide the
-    # learning rate by this ratio in order to ensure steps are the same scale as gradients, regardless
-    # of the choice of momentum.
+    
     kilostep_scale = 1024 * (1 + 1 / (1 - momentum))
-    lr = hyp['opt']['lr'] / kilostep_scale # un-decoupled learning rate for PyTorch SGD
+    lr = hyp['opt']['lr'] / kilostep_scale 
     wd = hyp['opt']['weight_decay'] * batch_size / kilostep_scale
     lr_biases = lr * hyp['opt']['bias_scaler']
 
     loss_fn = nn.CrossEntropyLoss(label_smoothing=hyp['opt']['label_smoothing'], reduction='none')
     test_loader = CifarLoader('cifar10', train=False, batch_size=2000)
     train_loader = CifarLoader('cifar10', train=True, batch_size=batch_size, aug=hyp['aug'])
+    
     if run == 'warmup':
-        # The only purpose of the first run is to warmup, so we can use dummy data
         train_loader.labels = torch.randint(0, 10, size=(len(train_loader.labels),), device=train_loader.labels.device)
+    
     total_train_steps = ceil(len(train_loader) * epochs)
-
     model = make_net()
     current_steps = 0
 
     norm_biases = [p for k, p in model.named_parameters() if 'norm' in k and p.requires_grad]
     other_params = [p for k, p in model.named_parameters() if 'norm' not in k and p.requires_grad]
-    
-    # --- OPTIMIZER (Standard SGD) ---
     param_configs = [dict(params=norm_biases, lr=lr_biases, weight_decay=wd/lr_biases),
                      dict(params=other_params, lr=lr, weight_decay=wd/lr)]
     optimizer = torch.optim.SGD(param_configs, momentum=momentum, nesterov=True)
@@ -462,14 +373,12 @@ def main(run):
     alpha_schedule = 0.95**5 * (torch.arange(total_train_steps+1) / total_train_steps)**3
     lookahead_state = LookaheadState(model)
 
-    # For accurately timing GPU code
     use_cuda_timing = (device.type == 'cuda')
     if use_cuda_timing:
         starter = torch.cuda.Event(enable_timing=True)
         ender = torch.cuda.Event(enable_timing=True)
     total_time_seconds = 0.0
 
-    # Initialize the whitening layer using training images
     if use_cuda_timing:
         starter.record()
     else:
@@ -486,13 +395,7 @@ def main(run):
         total_time_seconds += time.time() - start_time
 
     for epoch in range(ceil(epochs)):
-
         model[0].bias.requires_grad = (epoch < hyp['opt']['whiten_bias_epochs'])
-
-        ####################
-        #     Training     #
-        ####################
-
         if use_cuda_timing:
             starter.record()
         else:
@@ -500,7 +403,6 @@ def main(run):
 
         model.train()
         for inputs, labels in train_loader:
-
             outputs = model(inputs)
             loss = loss_fn(outputs, labels).sum()
             optimizer.zero_grad(set_to_none=True)
@@ -509,10 +411,8 @@ def main(run):
             scheduler.step()
 
             current_steps += 1
-
             if current_steps % 5 == 0:
                 lookahead_state.update(model, decay=alpha_schedule[current_steps].item())
-
             if current_steps >= total_train_steps:
                 if lookahead_state is not None:
                     lookahead_state.update(model, decay=1.0)
@@ -525,20 +425,10 @@ def main(run):
         else:
             total_time_seconds += time.time() - start_time
 
-        ####################
-        #    Evaluation    #
-        ####################
-
-        # Save the accuracy and loss from the last training batch of the epoch
         train_acc = (outputs.detach().argmax(1) == labels).float().mean().item()
         train_loss = loss.item() / batch_size
         val_acc = evaluate(model, test_loader, tta_level=0)
-        # print_training_details(locals(), is_final_entry=False) # Silenced per-epoch logs to keep output clean
-        run = None # Only print the run number once
-
-    ####################
-    #  TTA Evaluation  #
-    ####################
+        run = None 
 
     if use_cuda_timing:
         starter.record()
@@ -554,21 +444,16 @@ def main(run):
     else:
         total_time_seconds += time.time() - start_time
 
-    epoch = 'eval'
-    # print_training_details(locals(), is_final_entry=True)
-
-    # Return both accuracy and total wall-clock time for this run
     return tta_val_acc, total_time_seconds
 
-# --- NEW: Robust Continuous Logging Logic ---
+# --- FIX 2: Correct Logging Logic ---
 if __name__ == "__main__":
     # Ensure logs directory exists
     log_root = os.path.join('logs', EXPERIMENT_NAME)
     os.makedirs(log_root, exist_ok=True)
     
-    # Use a fixed file name per experiment so it's easy to find.
-    # WARNING: This deletes the old log for this specific experiment name.
-    csv_path = 'latest_run_log.csv'
+    # Correct path joining (Fixes Bug 2)
+    csv_path = os.path.join(log_root, 'latest_run_log.csv')
     
     if os.path.exists(csv_path):
         os.remove(csv_path)
@@ -577,7 +462,6 @@ if __name__ == "__main__":
     print(f"    Batch Size: {BATCH_SIZE}, Width: {WIDTH_MULTIPLIER}x, Groups: {USE_GROUPED_CONV}")
     print_columns(logging_columns_list, is_head=True)
     
-    # Initialize headers for the CSV file
     with open(csv_path, 'w') as f:
         f.write('run,final_val_acc,total_time_seconds\n')
 
@@ -588,14 +472,13 @@ if __name__ == "__main__":
             acc, seconds = main(run)
             results.append((acc, seconds))
             
-            # Print status and Save to CSV immediately
             print(f"Run {run:03d} | Acc: {acc:.4f} | Time: {seconds:.3f}s")
             
             with open(csv_path, 'a') as f:
                 f.write(f'{run},{acc},{seconds}\n')
                 
         except KeyboardInterrupt:
-            print("\n\nExperiment interrupted by user. Saving gathered data...")
+            print("\n\nExperiment interrupted by user.")
             break
         except Exception as e:
             print(f"\n\nRun {run} failed with error: {e}")
@@ -606,21 +489,16 @@ if __name__ == "__main__":
         accs = results_tensor[:, 0]
         times = results_tensor[:, 1]
 
-        mean_acc = accs.mean().item()
-        std_acc = accs.std(unbiased=False).item()
-        mean_time = times.mean().item()
-        std_time = times.std(unbiased=False).item()
-
         print('\n' + '-'*30)
         print(f'Completed {len(results)} runs')
-        print('Accuracy  - Mean: %.4f    Std: %.4f' % (mean_acc, std_acc))
-        print('Time (s)  - Mean: %.4f    Std: %.4f' % (mean_time, std_time))
+        print('Accuracy  - Mean: %.4f    Std: %.4f' % (accs.mean().item(), accs.std().item()))
+        print('Time (s)  - Mean: %.4f    Std: %.4f' % (times.mean().item(), times.std().item()))
         print('-'*30)
         
         print(f"CSV log saved to: {os.path.abspath(csv_path)}")
         
-        # Save .pt as well
-        pt_path = f"final_results_{EXPERIMENT_NAME}.pt"
+        # Save .pt as well with correct path
+        pt_path = os.path.join(log_root, f"final_results_{EXPERIMENT_NAME}.pt")
         torch.save({'accs': accs, 'times': times}, pt_path)
     else:
         print("No successful runs completed.")
