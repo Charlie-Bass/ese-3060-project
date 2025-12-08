@@ -29,7 +29,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # Config C (Free Lunch):    BS=1024, WIDTH=2.0, GROUPS=False
 # Config D (Architecture):  BS=1024, WIDTH=1.0, GROUPS=True
 
-EXPERIMENT_NAME = "h100_grouped"
+EXPERIMENT_NAME = "h100_4096_2.0"
 BATCH_SIZE = 4096
 WIDTH_MULTIPLIER = 1
 USE_GROUPED_CONV = False
