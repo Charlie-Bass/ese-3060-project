@@ -23,7 +23,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 #   "lazy2"     : Lazy Muon, orthogonalize every 2nd step
 #   "lazy4"     : Lazy Muon, orthogonalize every 4th step
 #   "lazy_sched": Lazy Muon with schedule 1 -> 2 -> 4 over training
-EXPERIMENT = "baseline"  # <<< CHANGE THIS TO SWITCH EXPERIMENTS
+EXPERIMENT = "lazy4"
 
 # Graphs: save train/val loss plots at the end (master process only)
 MAKE_PLOTS = True
