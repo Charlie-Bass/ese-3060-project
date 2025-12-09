@@ -435,13 +435,13 @@ class Hyperparameters:
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 200 # number of iterations to run chang back to 5100
+    num_iterations : int = 5100 # number of iterations to run chang back to 5100
     learning_rate : float = 0.0036
     warmup_iters : int = 0
     warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
-    val_loss_every : int = 50 # every how many steps to evaluate val loss? 0 for only at the end, change back to 125
+    val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end, change back to 125
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
     # Lazy Muon-related hyperparams (will be overwritten by EXPERIMENT block below)
