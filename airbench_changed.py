@@ -28,6 +28,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # Config B (Batch Speed):   BS=4096, WIDTH=1.0, GROUPS=False
 # Config C (Free Lunch):    BS=1024, WIDTH=2.0, GROUPS=False
 # Config D (Architecture):  BS=1024, WIDTH=1.0, GROUPS=True
+# Config E (Hero Run):      BS=2048, WIDTH=1.0, GROUPS=False
 
 EXPERIMENT_NAME = "2048"
 BATCH_SIZE = 2048
@@ -36,7 +37,7 @@ USE_GROUPED_CONV = False
 N_RUNS = 100
 # ----------------------------------------------------
 
-# --- FIX 1: Helper function for reproducibility ---
+# --- Helper function for reproducibility ---
 def set_seed(seed):
     torch.manual_seed(seed)
     random.seed(seed)
@@ -351,27 +352,17 @@ def main(run):
     
     total_train_steps = ceil(len(train_loader) * epochs)
     
-    # --- FIX START: Order of Operations ---
     model = make_net()
     
-    # 1. Grab a direct reference to the whitening layer (layer 0) BEFORE compiling.
-    # We need this reference to toggle requires_grad inside the loop later.
     whitening_layer = model[0] 
 
-    # 2. Initialize Whitening BEFORE compiling
-    # (Accessing model[0] on a compiled model causes the 'not subscriptable' error)
     train_images = train_loader.normalize(train_loader.images[:5000])
     init_whitening_conv(whitening_layer, train_images)
 
-    # 3. NOW we compile (The model structure is frozen, but weights can change)
     model = torch.compile(model)
-    # --- FIX END ---
 
     current_steps = 0
 
-    # Note: We must iterate over named_parameters of the ORIGINATING model if strictly needed, 
-    # but usually compiled models support .named_parameters(). 
-    # If this fails, we can use model._orig_mod.named_parameters()
     norm_biases = [p for k, p in model.named_parameters() if 'norm' in k and p.requires_grad]
     other_params = [p for k, p in model.named_parameters() if 'norm' not in k and p.requires_grad]
     
@@ -404,7 +395,6 @@ def main(run):
     else:
         start_time = time.time()
 
-    # (Whitening init moved to top)
 
     if use_cuda_timing:
         ender.record()
@@ -415,7 +405,7 @@ def main(run):
 
     for epoch in range(ceil(epochs)):
         
-        # --- FIX: Use the saved reference, not model[0] ---
+        # Use the saved reference, not model[0]
         whitening_layer.bias.requires_grad = (epoch < hyp['opt']['whiten_bias_epochs'])
         
         if use_cuda_timing:
@@ -468,13 +458,11 @@ def main(run):
 
     return tta_val_acc, total_time_seconds
 
-# --- FIX 2: Correct Logging Logic ---
+# Logging Logic
 if __name__ == "__main__":
-    # Ensure logs directory exists
     log_root = os.path.join('logs', EXPERIMENT_NAME)
     os.makedirs(log_root, exist_ok=True)
     
-    # Correct path joining (Fixes Bug 2)
     csv_path = os.path.join(log_root, 'latest_run_log.csv')
     
     if os.path.exists(csv_path):
