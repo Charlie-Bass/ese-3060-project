@@ -18,6 +18,26 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 # -----------------------------------------------------------------------------
+# EXPERIMENT SWITCHES (edit these)
+#   "baseline"  : original Muon every step
+#   "lazy2"     : Lazy Muon, orthogonalize every 2nd step
+#   "lazy4"     : Lazy Muon, orthogonalize every 4th step
+#   "lazy_sched": Lazy Muon with schedule 1 -> 2 -> 4 over training
+EXPERIMENT = "baseline"  # <<< CHANGE THIS TO SWITCH EXPERIMENTS
+
+# Graphs: save train/val loss plots at the end (master process only)
+MAKE_PLOTS = True
+
+if MAKE_PLOTS:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # headless
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"Warning: could not import matplotlib ({e}). Disabling plotting.")
+        MAKE_PLOTS = False
+
+# -----------------------------------------------------------------------------
 # Muon optimizer
 
 def zeropower_via_svd(G, steps=None):
@@ -80,6 +100,7 @@ class Muon(torch.optim.Optimizer):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
         super().__init__(params, defaults)
 
+    @torch.no_grad()
     def step(self):
         for group in self.param_groups:
             lr = group['lr']
@@ -103,6 +124,95 @@ class Muon(torch.optim.Optimizer):
                     g = zeropower_backend(g, steps=group['backend_steps'])
                     scale = max(g.size(0), g.size(1))**0.5 # scale to have update.square().mean() == 1
                 p.data.add_(g, alpha=-lr * scale)
+
+class LazyMuon(Muon):
+    """
+    Lazy Muon: Muon that only runs the expensive zeropower backend every `lazy_every` steps.
+
+    On skipped steps, it reuses the last orthogonalized direction for each parameter, rescaled
+    to match the current gradient norm. This amortizes orthogonalization cost over multiple steps.
+    """
+
+    def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True,
+                 backend='newtonschulz5', backend_steps=5, lazy_every: int = 4):
+        super().__init__(params, lr=lr, momentum=momentum,
+                         nesterov=nesterov, backend=backend, backend_steps=backend_steps)
+        # per-group lazy config
+        for group in self.param_groups:
+            group['lazy_every'] = lazy_every
+            group['lazy_step'] = 0
+
+        self.total_steps = 0
+        self.orth_steps = 0
+
+    @torch.no_grad()
+    def step(self):
+        self.total_steps += 1
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+            zeropower_backend = zeropower_backends[group['backend']]
+
+            # group-level lazy schedule
+            group['lazy_step'] += 1
+            lazy_every = max(1, group.get('lazy_every', 1))
+            run_backend = (group['lazy_step'] % lazy_every == 0)
+
+            for p in group['params']:
+                g = p.grad
+                if g is None:
+                    continue
+
+                state = self.state[p]
+                if 'momentum_buffer' not in state:
+                    state['momentum_buffer'] = torch.zeros_like(g)
+                buf = state['momentum_buffer']
+
+                # standard Muon momentum
+                buf.mul_(momentum).add_(g)
+                if group['nesterov']:
+                    g = g.add(buf, alpha=momentum)
+
+                if g.ndim != 2:
+                    # Fallback: no orthogonalization for non-2D tensors (shouldn't happen with this setup)
+                    p.data.add_(g, alpha=-lr)
+                    continue
+
+                # Detect QKV grouped parameters (same condition as baseline Muon)
+                is_qkv_group = (g.size(0) == 3 * g.size(1))
+
+                # key used to cache orthogonalized directions
+                cache_key = 'lazy_last_qkv' if is_qkv_group else 'lazy_last_ortho'
+
+                if run_backend or cache_key not in state:
+                    # Full orthogonalization step
+                    if is_qkv_group:
+                        chunks = g.split(g.size(1))
+                        ortho_chunks = [zeropower_backend(gc, steps=group['backend_steps']) for gc in chunks]
+                        g_ortho = torch.cat(ortho_chunks, dim=0)
+                        scale = g.size(1) ** 0.5
+                    else:
+                        g_ortho = zeropower_backend(g, steps=group['backend_steps'])
+                        scale = max(g_ortho.size(0), g_ortho.size(1)) ** 0.5
+
+                    state[cache_key] = g_ortho.detach().clone()
+                    self.orth_steps += 1
+                else:
+                    # Lazy step: reuse cached direction, rescale to current gradient norm
+                    last = state[cache_key]
+                    last = last.to(dtype=g.dtype, device=g.device)
+
+                    g_norm = g.float().norm()
+                    last_norm = last.float().norm()
+                    scale_factor = (g_norm / (last_norm + 1e-8)).to(dtype=g.dtype)
+
+                    g_ortho = last * scale_factor
+                    if is_qkv_group:
+                        scale = g.size(1) ** 0.5
+                    else:
+                        scale = max(g_ortho.size(0), g_ortho.size(1)) ** 0.5
+
+                p.data.add_(g_ortho, alpha=-lr * scale)
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
@@ -334,7 +444,32 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+    # Lazy Muon-related hyperparams (will be overwritten by EXPERIMENT block below)
+    use_lazy_muon : bool = False
+    lazy_every : int = 1
+    use_lazy_schedule : bool = False
+
 args = Hyperparameters()
+
+# Resolve EXPERIMENT into args
+if EXPERIMENT == "baseline":
+    args.use_lazy_muon = False
+    args.lazy_every = 1
+    args.use_lazy_schedule = False
+elif EXPERIMENT == "lazy2":
+    args.use_lazy_muon = True
+    args.lazy_every = 2
+    args.use_lazy_schedule = False
+elif EXPERIMENT == "lazy4":
+    args.use_lazy_muon = True
+    args.lazy_every = 4
+    args.use_lazy_schedule = False
+elif EXPERIMENT == "lazy_sched":
+    args.use_lazy_muon = True
+    args.lazy_every = 1  # start with full Muon, schedule will adjust
+    args.use_lazy_schedule = True
+else:
+    raise ValueError(f"Unknown EXPERIMENT={EXPERIMENT}")
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
 assert torch.cuda.is_available()
@@ -360,6 +495,7 @@ train_accumulation_steps = args.batch_size // (B * ddp_world_size)
 train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
 val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
 if master_process:
+    print(f"Experiment: {EXPERIMENT}")
     print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
     print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
 x, y = train_loader.next_batch()
@@ -380,8 +516,23 @@ ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 # init the optimizer(s)
 optimizer1 = torch.optim.AdamW(raw_model.lm_head.parameters(), lr=args.learning_rate, betas=(0.9, 0.95),
                                weight_decay=args.weight_decay, fused=True)
-optimizer2 = Muon(raw_model.transformer.h.parameters(), lr=0.1*args.learning_rate, momentum=0.95)
+
+if args.use_lazy_muon:
+    optimizer2 = LazyMuon(raw_model.transformer.h.parameters(),
+                          lr=0.1*args.learning_rate,
+                          momentum=0.95,
+                          backend='newtonschulz5',
+                          backend_steps=5,
+                          lazy_every=args.lazy_every)
+else:
+    optimizer2 = Muon(raw_model.transformer.h.parameters(),
+                      lr=0.1*args.learning_rate,
+                      momentum=0.95,
+                      backend='newtonschulz5',
+                      backend_steps=5)
+
 optimizers = [optimizer1, optimizer2]
+
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
     assert it <= args.num_iterations
@@ -405,7 +556,7 @@ if master_process:
     logfile = 'logs/%s.txt' % run_id
     # create the log file
     with open(logfile, "w") as f:
-        # begin the log by printing this file (the Python code)
+        f.write(f'# Experiment: {EXPERIMENT}\n')
         f.write('='*100 + '\n')
         f.write(code)
         f.write('='*100 + '\n')
@@ -418,6 +569,10 @@ if master_process:
         f.write('='*100 + '\n')
 
 training_time_ms = 0
+# for plotting later
+train_history = []  # list of (step, train_loss)
+val_history = []    # list of (step, val_loss)
+
 # start the clock
 torch.cuda.synchronize()
 t0 = time.time()
@@ -425,13 +580,22 @@ t0 = time.time()
 train_loader.reset()
 for step in range(args.num_iterations + 1):
     last_step = (step == args.num_iterations)
-    # This effectively ignores timing first 10 steps, which are slower for weird reasons.
-    # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
-    # steps with dummy data first, and then re-initialize the model and reset the loader.
+    # Ignore timing first 10 steps
     if step == 10:
         training_time_ms = 0
         t0 = time.time()
     timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
+
+    # optional: update Lazy Muon schedule
+    if args.use_lazy_muon and args.use_lazy_schedule and isinstance(optimizer2, LazyMuon):
+        if step < 0.25 * args.num_iterations:
+            new_lazy = 1
+        elif step < 0.5 * args.num_iterations:
+            new_lazy = 2
+        else:
+            new_lazy = 4
+        for g in optimizer2.param_groups:
+            g['lazy_every'] = new_lazy
 
     # once in a while evaluate the validation dataset
     if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
@@ -450,11 +614,25 @@ for step in range(args.num_iterations + 1):
                 del loss
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
+
+        # store for plotting (master will use it)
+        if master_process:
+            val_history.append((step, float(val_loss)))
+
         # log val loss to console and to logfile
         if master_process:
-            print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+            orth_frac_str = ""
+            if isinstance(optimizer2, LazyMuon) and optimizer2.total_steps > 0:
+                orth_frac = optimizer2.orth_steps / optimizer2.total_steps
+                orth_frac_str = f" orth_frac:{orth_frac:.2f}"
+
+            print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} '
+                  f'train_time:{training_time_ms:.0f}ms '
+                  f'step_avg:{training_time_ms/(timed_steps-1):.2f}ms{orth_frac_str}')
             with open(logfile, "a") as f:
-                f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
+                f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} '
+                        f'train_time:{training_time_ms:.0f}ms '
+                        f'step_avg:{training_time_ms/(timed_steps-1):.2f}ms{orth_frac_str}\n')
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -503,12 +681,46 @@ for step in range(args.num_iterations + 1):
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
 
+    # store for plotting (master only cares later)
+    if master_process:
+        train_history.append((step+1, float(train_loss)))
+
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
     if master_process:
         approx_time = training_time_ms + 1000 * (time.time() - t0)
-        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} "
+              f"train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
         with open(logfile, "a") as f:
-            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} "
+                    f"train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+
+    # -------------------------------------------------------------------------
+    # Plotting: save train and validation loss curves
+    # -------------------------------------------------------------------------
+    if MAKE_PLOTS:
+        if val_history:
+            steps_v = [s for (s, _) in val_history]
+            vals_v = [v for (_, v) in val_history]
+            plt.figure()
+            plt.plot(steps_v, vals_v, marker='o')
+            plt.xlabel("Step")
+            plt.ylabel("Validation loss")
+            plt.title(f"Validation loss ({EXPERIMENT})")
+            plt.grid(True)
+            plt.savefig(os.path.join(logdir, "val_loss.png"))
+            plt.close()
+
+        if train_history:
+            steps_t = [s for (s, _) in train_history]
+            vals_t = [v for (_, v) in train_history]
+            plt.figure()
+            plt.plot(steps_t, vals_t)
+            plt.xlabel("Step")
+            plt.ylabel("Training loss")
+            plt.title(f"Training loss ({EXPERIMENT})")
+            plt.grid(True)
+            plt.savefig(os.path.join(logdir, "train_loss.png"))
+            plt.close()
