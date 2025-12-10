@@ -1,68 +1,59 @@
-# ESE 3060 Final Project Fall 2025
+```markdown
+# ESE 3060 Final Project – Fall 2025
 
-## Project Overview
-This project contains two machine learning training benchmarks:
-- **airbench94.py**: CIFAR-10 image classification benchmark
-- **train_gpt.py**: GPT-2 training on the FineWeb-10B dataset
+## Overview
+This repo contains two small ML experiments:
+- `airbench94_changed.py` – CIFAR-10 image classification benchmark (Part 1)
+- `train_gpt.py` – NanoGPT-style language model on FineWeb-10B (Part 2)
 
-## Setup and Installation
+## Setup
+Make sure you have Python 3.8+ and an NVIDIA GPU with CUDA (A100/H100 recommended).
 
-### Prerequisites
-- Python 3.8+
-- NVIDIA GPU (A100/H100 recommended)
-- CUDA 11.7 or later
-
-### Dependencies
-Install all required packages:
+From the repo root, install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
-## Running airbench94.py
+## Part 1 – CIFAR-10 benchmark (airbench94_changed.py)
 
-### Overview
-CIFAR-10 training benchmark achieving 94.01% average accuracy in 3.83 seconds on an NVIDIA A100. You will want to use a single node of an a100.
-- CIFAR-10 dataset automatically downloaded on first run
-- Cached to `cifar10/` directory as `.pt` files for faster subsequent runs
-
-### Execution
+### How to run
+From the repo root:
 ```bash
-python airbench94.py
+python airbench94_changed.py
 ```
 
-Runs 25 training iterations and reports mean/standard deviation accuracy metrics.
+### What it does
+- Automatically downloads CIFAR-10 the first time it runs.
+- Caches preprocessed data under `cifar10/` for faster re-runs.
+- Trains a small CNN and prints mean / standard-deviation test accuracy and timing to the terminal.
+- Raw logs are saved under:
+  ```
+  logs/<uuid>/log.pt
+  ```
 
-### Output
-- Per-epoch training metrics (loss, accuracy)
-- Validation and test-time augmentation (TTA) accuracy
-- Logs saved to `logs/{uuid}/log.pt`
+## Part 2 – NanoGPT benchmark (train_gpt.py)
 
-### Hardware Requirements
-- NVIDIA A100 GPU recommended
-- CUDA 11.7+
-- NVIDIA Driver 515.105.01 or compatible
-
-### Reference
-Based on: [cifar10-airbench legacy airbench94.py](https://github.com/KellerJordan/cifar10-airbench/blob/master/legacy/airbench94.py)
-
-## Running train_gpt.py
-
-### Overview
-Trains a GPT-2 model on the FineWeb-10B dataset. You will want to use an 8xH100.
-
-### Execution
-Download the data with 
+### 1. Download and cache FineWeb-10B
+From the repo root:
 ```bash
 python cached_fineweb10B.py 9
 ```
-and then run the script with 
-```bash
-torchrun --standalone --nproc_per_node=8 train_gpt.py
+This creates `data/fineweb10B/` with the pre-tokenized `.bin` shards.
+
+### 2. Select an experiment
+At the top of `train_gpt.py`, set:
+```python
+EXPERIMENT = "baseline"      # or "lazy_2", "lazy_4", "lazy_sched"
 ```
 
-### Hardware Requirements
-- Tested on 8× NVIDIA H100 80GB GPUs
-- PyTorch 2.4.1+ with CUDA 12.1
+### 3. Run training
+Single-GPU run:
+```bash
+torchrun --standalone --nproc_per_node=1 train_gpt.py
+```
+(For multi-GPU, increase `--nproc_per_node` to the number of GPUs, e.g. 8 on an 8×H100 node.)
 
-### Reference
-Based on: [modded-nanogpt record number #5](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/track_1_short/2024-10-14_ModernArch/dabaaddd-237c-4ec9-939d-6608a9ed5e27.txt)
+### Outputs
+- Training logs are written to `logs/`
+- Parsed CSV metrics for each run are stored in `logs/metrics/` and can be used to make the plots in the report
+```
