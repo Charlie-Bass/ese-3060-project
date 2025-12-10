@@ -18,14 +18,13 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 # -----------------------------------------------------------------------------
-# EXPERIMENT SWITCHES (edit these)
+# Experiments
 #   "baseline"  : original Muon every step
 #   "lazy2"     : Lazy Muon, orthogonalize every 2nd step
 #   "lazy4"     : Lazy Muon, orthogonalize every 4th step
 #   "lazy_sched": Lazy Muon with schedule 1 -> 2 -> 4 over training
 EXPERIMENT = "lazy4"
 
-# Graphs: save train/val loss plots at the end (master process only)
 MAKE_PLOTS = True
 
 if MAKE_PLOTS:
@@ -174,7 +173,6 @@ class LazyMuon(Muon):
                     g = g.add(buf, alpha=momentum)
 
                 if g.ndim != 2:
-                    # Fallback: no orthogonalization for non-2D tensors (shouldn't happen with this setup)
                     p.data.add_(g, alpha=-lr)
                     continue
 
@@ -258,7 +256,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
         # output projection
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        self.c_proj.weight.data.zero_()
         self.rotary = Rotary(self.head_dim)
 
     def forward(self, x):
@@ -268,7 +266,7 @@ class CausalSelfAttention(nn.Module):
         v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
         cos, sin = self.rotary(q)
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
@@ -280,11 +278,11 @@ class MLP(nn.Module):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
-        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        self.c_proj.weight.data.zero_()
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        x = F.relu(x).square()
         x = self.c_proj(x)
         return x
 
@@ -307,7 +305,7 @@ class Block(nn.Module):
 class GPTConfig:
     vocab_size : int = 50304
     n_layer : int = 12
-    n_head : int = 6 # head dim 128 suggested by @Grad62304977
+    n_head : int = 6
     n_embd : int = 768
 
 class GPT(nn.Module):
@@ -321,7 +319,7 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.transformer.wte.weight = self.lm_head.weight
 
     def forward(self, idx, targets=None, return_logits=True):
 
@@ -334,12 +332,12 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            logits = logits.float() # use tf32/fp32 for logits
+            logits = logits.float()
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            logits = logits.float() # use tf32/fp32 for logits
+            logits = logits.float()
             loss = None
 
         # there are performance reasons why not returning logits is prudent, if not needed
@@ -349,12 +347,11 @@ class GPT(nn.Module):
         return logits, loss
 
 # -----------------------------------------------------------------------------
-# Our own simple Distributed Data Loader
+# Own simple Distributed Data Loader
 
 def _peek_data_shard(filename):
     # only reads the header, returns header data
     with open(filename, "rb") as f:
-        # first read the header, which is 256 int32 integers (4 bytes each)
         header = np.frombuffer(f.read(256*4), dtype=np.int32)
     if header[0] != 20240520:
         print("ERROR: magic number mismatch in the data .bin file!")
@@ -363,17 +360,15 @@ def _peek_data_shard(filename):
         print("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
         exit(1)
     assert header[1] == 1, "unsupported version"
-    ntok = header[2] # number of tokens (claimed)
-    return ntok # for now just return the number of tokens
+    ntok = header[2] 
+    return ntok 
 
 def _load_data_shard(filename):
     with open(filename, "rb") as f:
-        # first read the header, which is 256 int32 integers (4 bytes each)
         header = np.frombuffer(f.read(256*4), dtype=np.int32)
         assert header[0] == 20240520, "magic number mismatch in the data .bin file"
         assert header[1] == 1, "unsupported version"
-        ntok = header[2] # number of tokens (claimed)
-        # the rest of it are tokens, stored as uint16
+        ntok = header[2] 
         tokens = np.frombuffer(f.read(), dtype=np.uint16)
     assert len(tokens) == ntok, "number of tokens read does not match header?"
     return tokens
@@ -451,7 +446,7 @@ class Hyperparameters:
 
 args = Hyperparameters()
 
-# Resolve EXPERIMENT into args
+# Resolve experiment into args
 if EXPERIMENT == "baseline":
     args.use_lazy_muon = False
     args.lazy_every = 1
@@ -500,13 +495,13 @@ if master_process:
     print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
 x, y = train_loader.next_batch()
 
-# there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
+# there are only 50257 unique GPT-2 tokens, extended to nearest multiple of 128 for efficiency
 # this originates from Karpathy's experiments.
 num_vocab = 50304
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
-    config.coordinate_descent_tuning = True # suggested by @Chillee
+    config.coordinate_descent_tuning = True 
 model = torch.compile(model)
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
@@ -584,9 +579,8 @@ for step in range(args.num_iterations + 1):
     if step == 10:
         training_time_ms = 0
         t0 = time.time()
-    timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
+    timed_steps = float('nan') if step <= 11 else (step - 10) + 1 
 
-    # optional: update Lazy Muon schedule
     if args.use_lazy_muon and args.use_lazy_schedule and isinstance(optimizer2, LazyMuon):
         if step < 0.25 * args.num_iterations:
             new_lazy = 1
@@ -608,7 +602,7 @@ for step in range(args.num_iterations + 1):
         val_loss = 0.0
         for _ in range(val_steps):
             x_val, y_val = val_loader.next_batch()
-            with ctx: # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
+            with ctx: # would like to use no_grad() here too, but that creates a torch.compile error for some reason
                 _, loss = model(x_val, y_val, return_logits=False)
                 val_loss += loss.detach()
                 del loss
@@ -648,14 +642,10 @@ for step in range(args.num_iterations + 1):
         torch.cuda.synchronize()
         t0 = time.time()
 
-    # bit confusing: we want to make sure to eval on 0th iteration
-    # but also after the very last iteration. so we loop for step <= num_iterations
-    # instead of just < num_iterations (one extra due to <=), only to do
-    # the validation/sampling one last time, and then we break right here as we're done.
     if last_step:
         break
 
-    # --------------- TRAINING SECTION BEGIN -----------------
+    # --------------- training
     model.train()
     for i in range(1, train_accumulation_steps+1):
         # forward pass
@@ -666,7 +656,7 @@ for step in range(args.num_iterations + 1):
         x, y = train_loader.next_batch()
         # backward pass
         if i < train_accumulation_steps:
-            with model.no_sync(): # there's no need to sync gradients every accumulation step
+            with model.no_sync(): # no sync gradients every accumulation step
                 loss.backward()
         else:
             loss.backward() # just sync on the last step
@@ -678,14 +668,12 @@ for step in range(args.num_iterations + 1):
         sched.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
-    # --------------- TRAINING SECTION END -------------------
-    # everything that follows now is just diagnostics, prints, logging, etc.
-
+    # --------------- training end
+    
     # store for plotting (master only cares later)
     if master_process:
         train_history.append((step+1, float(train_loss)))
 
-    #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
     if master_process:
         approx_time = training_time_ms + 1000 * (time.time() - t0)
         print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} "
@@ -698,7 +686,7 @@ if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
     # -------------------------------------------------------------------------
-    # Plotting: save train and validation loss curves
+    # Plotting
     # -------------------------------------------------------------------------
     if MAKE_PLOTS:
         if val_history:
