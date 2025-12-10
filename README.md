@@ -7,6 +7,7 @@ python airbench94_changed.py
 ```
 
 ### What it does
+- Runs experiments by changing configs at the top
 - Automatically downloads CIFAR-10 the first time it runs.
 - Caches preprocessed data under `cifar10/` for faster re-runs.
 - Trains a small CNN and prints mean / standard-deviation test accuracy and timing to the terminal.
