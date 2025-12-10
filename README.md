@@ -1,19 +1,3 @@
-```markdown
-# ESE 3060 Final Project – Fall 2025
-
-## Overview
-This repo contains two small ML experiments:
-- `airbench94_changed.py` – CIFAR-10 image classification benchmark (Part 1)
-- `train_gpt.py` – NanoGPT-style language model on FineWeb-10B (Part 2)
-
-## Setup
-Make sure you have Python 3.8+ and an NVIDIA GPU with CUDA (A100/H100 recommended).
-
-From the repo root, install dependencies:
-```bash
-pip install -r requirements.txt
-```
-
 ## Part 1 – CIFAR-10 benchmark (airbench94_changed.py)
 
 ### How to run
